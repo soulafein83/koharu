@@ -46,6 +46,10 @@ pub struct InpainterConfig {
     /// What the model is asked when a run brings no prompt of its own, as an
     /// area's can; LaMa, which takes none, ignores it.
     pub prompt: String,
+    /// Base URL of a remote inference server. When set, inpainting runs there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub remote: Option<String>,
 }
 
 impl Default for InpainterConfig {
@@ -63,6 +67,7 @@ impl Default for InpainterConfig {
                 Remove all the text, including dialogue, sound effects, and handwritten notes.
                 Leave speech bubbles empty and keep everything else exactly the same."}
             .to_owned(),
+            remote: None,
         }
     }
 }
@@ -128,7 +133,7 @@ pub(crate) async fn inpaint(
     let Some(work) = work else {
         return Ok(());
     };
-    let key = key(Stage::Inpaint, config).expect("an inpainter is Koharu's");
+    let remote = config.inpainter.remote.clone();
     let model = config.inpainter.model;
     // An area's own prompt names its layer, as Photoshop names a Generative
     // Fill's layer after its prompt.
@@ -137,24 +142,36 @@ pub(crate) async fn inpaint(
     let prompt = own.unwrap_or_else(|| config.inpainter.prompt.clone());
     let asked = prompt.clone();
     let (cancel, runtime) = (member.cancel.clone(), Handle::current());
-    let work = task
-        .inference(&[member], move |models| {
-            // What the fill tiers rebuilt all of needs no model.
-            if work.regions.is_empty() {
-                return Ok(work);
-            }
-            let inpainter = models.get(&key, |device| model::load(model, device))?;
-            // Stop ends the redraw under way as well as the windows after it.
-            let _stop = inpainter.canceller().map(|canceller| {
-                let cancel = cancel.clone();
-                AbortOnDropHandle::new(runtime.spawn(async move {
-                    cancel.cancelled().await;
-                    canceller.cancel();
-                }))
-            });
-            redraw::windows(work, inpainter.as_ref(), &asked, &cancel)
+    let work = if work.regions.is_empty() {
+        work
+    } else if let Some(base) = remote {
+        let cancel2 = cancel.clone();
+        let asked2 = asked.clone();
+        tokio::task::spawn_blocking(move || {
+            let inpainter = model::RemoteInpainter { base, model };
+            redraw::windows(work, &inpainter, &asked2, &cancel2)
         })
-        .await?;
+        .await?
+        .map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        let key = key(Stage::Inpaint, config).expect("an inpainter is Koharu's");
+        task
+            .inference(&[member], move |models| {
+                if work.regions.is_empty() {
+                    return Ok(work);
+                }
+                let inpainter = models.get(&key, |device| model::load(model, device))?;
+                let _stop = inpainter.canceller().map(|canceller| {
+                    let cancel = cancel.clone();
+                    AbortOnDropHandle::new(runtime.spawn(async move {
+                        cancel.cancelled().await;
+                        canceller.cancel();
+                    }))
+                });
+                redraw::windows(work, inpainter.as_ref(), &asked, &cancel)
+            })
+            .await?
+    };
     let page = member.page;
     let parameters = (!prompt.trim().is_empty()).then(|| serde_json::json!({"prompt": prompt}));
     let made = action("c2pa.created", &model.to_string(), parameters);

@@ -168,3 +168,90 @@ pub(super) async fn load(model: Inpainter, device: &'static Device) -> anyhow::R
         Inpainter::QwenImage => Box::new(QwenImage::load(device).await?),
     })
 }
+
+/// An inpainter that runs on a remote server over HTTP.
+pub struct RemoteInpainter {
+    pub base: String,
+    pub model: Inpainter,
+}
+
+impl Inpaint for RemoteInpainter {
+    fn inference(
+        &self,
+        image: &RgbImage,
+        mask: &GrayImage,
+        prompt: &str,
+    ) -> anyhow::Result<RgbImage> {
+        use std::io::Cursor;
+        let image = image.clone();
+        let mask = mask.clone();
+        let prompt = prompt.to_owned();
+        let base = self.base.clone();
+        let model = self.model;
+        let handle = std::thread::spawn(move || -> anyhow::Result<RgbImage> {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!(e))?;
+            rt.block_on(async move {
+                let mut img_buf = Vec::new();
+                image::DynamicImage::ImageRgb8(image.clone())
+                    .write_to(&mut Cursor::new(&mut img_buf), image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let mut mask_buf = Vec::new();
+                image::DynamicImage::ImageLuma8(mask.clone())
+                    .write_to(&mut Cursor::new(&mut mask_buf), image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let model_id = serde_json::to_string(&model)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .trim_matches('"')
+                    .to_owned();
+                let url = format!("{}/inpaint", base.trim_end_matches('/'));
+                let form = reqwest::multipart::Form::new()
+                    .part(
+                        "image",
+                        reqwest::multipart::Part::bytes(img_buf)
+                            .file_name("image.png")
+                            .mime_str("image/png")
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    )
+                    .part(
+                        "mask",
+                        reqwest::multipart::Part::bytes(mask_buf)
+                            .file_name("mask.png")
+                            .mime_str("image/png")
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    )
+                    .text("model", model_id)
+                    .text("prompt", prompt);
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(&url)
+                    .multipart(form)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let status = resp.status();
+                let bytes = resp.bytes().await.map_err(|e| anyhow::anyhow!(e))?;
+                if !status.is_success() {
+                    anyhow::bail!(
+                        "remote inpaint failed: {} {}",
+                        status,
+                        String::from_utf8_lossy(&bytes)
+                    );
+                }
+                let img = image::load_from_memory(&bytes).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(img.to_rgb8())
+            })
+        });
+        handle.join().map_err(|_| anyhow::anyhow!("thread panicked"))?
+    }
+
+    fn generative(&self) -> bool {
+        matches!(self.model, Inpainter::Flux3Klein | Inpainter::QwenImage)
+    }
+
+    fn pass(&self) -> u32 {
+        match self.model {
+            Inpainter::Lama => lama::WHOLE,
+            _ => u32::MAX,
+        }
+    }
+}

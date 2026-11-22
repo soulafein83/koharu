@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     detect_remote: Option<String>,
 
+    /// Base URL of a remote inference server for inpainting.
+    #[arg(long, value_name = "URL")]
+    inpaint_remote: Option<String>,
+
     /// The translation model, as a `vendor/model` reference.
     #[arg(long, value_name = "MODEL")]
     translator: Option<String>,
@@ -122,6 +126,9 @@ async fn main() -> Result<()> {
     }
     if let Some(remote) = cli.detect_remote {
         config.detector.remote = Some(remote);
+    }
+    if let Some(remote) = cli.inpaint_remote {
+        config.inpainter.remote = Some(remote);
     }
     config.translator.vision = cli.vision;
     config.translator.reasoning = cli.reasoning.map(Into::into);
