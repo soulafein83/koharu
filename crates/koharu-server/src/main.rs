@@ -7,6 +7,7 @@ use axum::{
 };
 use image::DynamicImage;
 use koharu_ml::hayai_ocr::HayaiOcr;
+use koharu_ml::koharu_layout_highres::{KoharuLayoutHighres, Options};
 use koharu_runtime;
 use serde::Serialize;
 use serde_json::json;
@@ -15,7 +16,8 @@ use tracing::info;
 
 #[derive(Clone)]
 struct AppState {
-    model: Arc<Mutex<Option<HayaiOcr>>>,
+    ocr: Arc<Mutex<Option<HayaiOcr>>>,
+    detector: Arc<Mutex<Option<koharu_ml::koharu_layout_highres::KoharuLayoutHighres>>>,
 }
 
 #[derive(Serialize)]
@@ -31,12 +33,14 @@ async fn main() {
         .init();
 
     let state = AppState {
-        model: Arc::new(Mutex::new(None)),
+        ocr: Arc::new(Mutex::new(None)),
+        detector: Arc::new(Mutex::new(None)),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/ocr", post(ocr))
+        .route("/detect", post(detect))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 13306));
@@ -80,7 +84,7 @@ async fn ocr(
     }
 
     // Lazy-load model.
-    let mut guard = state.model.lock().await;
+    let mut guard = state.ocr.lock().await;
     if guard.is_none() {
         let device = koharu_runtime::device()
             .await
@@ -98,4 +102,64 @@ async fn ocr(
         texts,
         language: "und",
     }))
+}
+
+
+#[derive(serde::Deserialize)]
+struct DetectQuery {
+    text: Option<f32>,
+    onomatopoeia: Option<f32>,
+    bubble: Option<f32>,
+    panel: Option<f32>,
+}
+
+async fn detect(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<DetectQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<koharu_ml::remote::RemoteLayout>, (axum::http::StatusCode, String)> {
+    let mut image: Option<image::DynamicImage> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?
+    {
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+        image = Some(
+            image::load_from_memory(&bytes)
+                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?,
+        );
+        break;
+    }
+    let image = image.ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "no image uploaded".to_owned(),
+    ))?;
+
+    let mut guard = state.detector.lock().await;
+    if guard.is_none() {
+        let device = koharu_runtime::device()
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let model = KoharuLayoutHighres::load(device)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        *guard = Some(model);
+    }
+    let model = guard.as_ref().unwrap();
+    let options = Options {
+        text: q.text,
+        onomatopoeia: q.onomatopoeia,
+        bubble: q.bubble,
+        panel: q.panel,
+    };
+    let detected = model
+        .inference(&image, &options)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let pixels = image.to_rgb8();
+    let layout = detected.layout(&pixels);
+    Ok(Json(koharu_ml::remote::RemoteLayout::from(&layout)))
 }

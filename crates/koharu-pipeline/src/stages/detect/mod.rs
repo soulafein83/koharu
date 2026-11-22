@@ -15,7 +15,7 @@ pub use self::model::Detector;
 use super::{Task, key};
 use crate::{PipelineConfig, Stage};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(specta::Type)]
 pub struct DetectorConfig {
@@ -34,6 +34,10 @@ pub struct DetectorConfig {
     #[serde(deserialize_with = "threshold")]
     #[specta(type = Option<f32>)]
     pub panel: Option<f32>,
+    /// Base URL of a remote inference server. When set, detection runs there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub remote: Option<String>,
 }
 
 fn threshold<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f32>, D::Error> {
@@ -58,29 +62,74 @@ pub(crate) async fn detect(task: &Task, config: &PipelineConfig) -> anyhow::Resu
     let Some((_, scan)) = scan else {
         return Ok(());
     };
-    let key = key(Stage::Detect, config).expect("a detector is Koharu's");
-    let config = config.detector;
-    let options = Options {
-        text: config.text,
-        onomatopoeia: config.onomatopoeia,
-        bubble: config.bubble,
-        panel: config.panel,
-    };
-    let (scan, detected) = task
-        .inference(&[member], move |models| {
-            let detector = models.get(&key, |device| model::load(config.model, device))?;
-            let detected = detector.inference(&scan, &options)?;
-            Ok((scan, detected))
-        })
-        .await?;
+    let remote = config.detector.remote.clone();
+    let det_config = config.detector.clone();
+    let name = det_config.model.to_string();
     let page = member.page;
-    let name = config.model.to_string();
+
+    // Obtain the layout either from a remote server or locally.
+    let (scan, layout): (image::DynamicImage, koharu_ml::koharu_layout_highres::Layout) =
+        if let Some(base) = remote {
+            // send scan PNG to remote /detect
+            let mut buf = Vec::new();
+            let png_bytes = {
+                let mut c = std::io::Cursor::new(&mut buf);
+                scan.write_to(&mut c, image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                buf
+            };
+            let client = reqwest::Client::new();
+            let mut url = format!("{}/detect", base.trim_end_matches('/'));
+            let mut qs = Vec::new();
+            if let Some(v) = det_config.text { qs.push(format!("text={}", v)); }
+            if let Some(v) = det_config.onomatopoeia { qs.push(format!("onomatopoeia={}", v)); }
+            if let Some(v) = det_config.bubble { qs.push(format!("bubble={}", v)); }
+            if let Some(v) = det_config.panel { qs.push(format!("panel={}", v)); }
+            if !qs.is_empty() { url = format!("{}?{}", url, qs.join("&")); }
+            let form = reqwest::multipart::Form::new().part(
+                "image",
+                reqwest::multipart::Part::bytes(png_bytes)
+                    .file_name("page.png")
+                    .mime_str("image/png")
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            );
+            let resp = client
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!(e))?;
+            if !status.is_success() {
+                anyhow::bail!("remote detect failed: {} {}", status, body);
+            }
+            let remote_layout: koharu_ml::remote::RemoteLayout =
+                serde_json::from_value(body).map_err(|e| anyhow::anyhow!(e))?;
+            (scan, koharu_ml::koharu_layout_highres::Layout::from(remote_layout))
+        } else {
+            let key = key(Stage::Detect, config).expect("a detector is Koharu's");
+            let cfg = det_config.clone();
+            let options = Options {
+                text: cfg.text,
+                onomatopoeia: cfg.onomatopoeia,
+                bubble: cfg.bubble,
+                panel: cfg.panel,
+            };
+            let (scan, detected) = task
+                .inference(&[member], move |models| {
+                    let detector = models.get(&key, |device| model::load(cfg.model, device))?;
+                    let detected = detector.inference(&scan, &options)?;
+                    Ok((scan, detected))
+                })
+                .await?;
+            let pixels = scan.to_rgb8();
+            let layout = detected.layout(&pixels);
+            (scan, layout)
+        };
+
     let additions = tokio::task::spawn_blocking(move || {
         let pixels = scan.to_rgb8();
-        let layout = {
-            let _span = tracing::info_span!("layout").entered();
-            detected.layout(&pixels)
-        };
         let _span = tracing::info_span!("typography").entered();
         let typography: Vec<Option<Typography>> = layout
             .lettering
