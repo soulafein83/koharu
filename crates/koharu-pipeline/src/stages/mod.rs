@@ -216,7 +216,12 @@ pub(crate) async fn run(task: Task, inputs: Inputs) -> Result<(), String> {
 pub(crate) fn key(stage: Stage, config: &PipelineConfig) -> Option<Key> {
     let name = match stage {
         Stage::Detect => config.detector.model.to_string(),
-        Stage::Recognize => config.recognizer.model.to_string(),
+        Stage::Recognize => {
+            if config.recognizer.remote.is_some() {
+                return None;
+            }
+            config.recognizer.model.to_string()
+        }
         Stage::Inpaint => config.inpainter.model.to_string(),
         Stage::Translate => {
             let translator = &config.translator;

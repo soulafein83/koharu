@@ -15,11 +15,16 @@ pub use self::model::Recognizer;
 use super::{Member, Task, action, key};
 use crate::{PipelineConfig, Stage};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(specta::Type)]
 pub struct RecognizerConfig {
     pub model: Recognizer,
+    /// Base URL of a remote inference server (e.g. http://192.168.0.156:13306).
+    /// When set, OCR runs there instead of a local model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(type = Option<String>)]
+    pub remote: Option<String>,
 }
 
 pub(crate) async fn recognize(task: &Task, config: &PipelineConfig) -> anyhow::Result<()> {
@@ -42,33 +47,92 @@ pub(crate) async fn recognize(task: &Task, config: &PipelineConfig) -> anyhow::R
     }
     let (members, crops): (Vec<Member>, Vec<Vec<(LayerId, DynamicImage)>>) =
         read.into_iter().unzip();
-    let key = key(Stage::Recognize, config).expect("a recognizer is Koharu's");
-    let model = config.recognizer.model;
-    let (texts, language) = task
-        .inference(&members.iter().collect::<Vec<_>>(), move |models| {
-            let recognizer = models.get(&key, |device| model::load(model, device))?;
-            let counts: Vec<usize> = crops.iter().map(Vec::len).collect();
-            let (blocks, images): (Vec<LayerId>, Vec<DynamicImage>) =
-                crops.into_iter().flatten().unzip();
-            let _span = tracing::info_span!("ocr", crops = images.len()).entered();
-            let texts = recognizer.inference(&images)?;
+    let name = config.recognizer.model.to_string();
+    let remote = config.recognizer.remote.clone();
+    let counts: Vec<usize> = crops.iter().map(Vec::len).collect();
+    let (blocks, images): (Vec<LayerId>, Vec<DynamicImage>) =
+        crops.into_iter().flatten().unzip();
+
+    let (texts, language): (Vec<Vec<(LayerId, String)>>, String) =
+        if let Some(base) = remote {
+            let client = reqwest::Client::new();
+            let url = format!("{}/ocr", base.trim_end_matches('/'));
+            let mut form = reqwest::multipart::Form::new();
+            for (i, img) in images.iter().enumerate() {
+                let mut buf = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let part = reqwest::multipart::Part::bytes(buf)
+                    .file_name(format!("{}.png", i))
+                    .mime_str("image/png")
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                form = form.part("image", part);
+            }
+            let resp = client
+                .post(&url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if !status.is_success() {
+                anyhow::bail!("remote ocr failed: {} {}", status, body);
+            }
+            let remote_texts: Vec<String> = body
+                .get("texts")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
             anyhow::ensure!(
-                texts.len() == images.len(),
+                remote_texts.len() == images.len(),
                 "{} texts for {} blocks",
-                texts.len(),
+                remote_texts.len(),
                 images.len()
             );
-            let mut read = blocks.into_iter().zip(texts);
+            let lang = body
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("und");
+            // leak to &'static str to match local branch type
+            let lang_owned = lang.to_owned();
+            let mut read = blocks.into_iter().zip(remote_texts);
             let texts: Vec<Vec<(LayerId, String)>> = counts
                 .into_iter()
                 .map(|count| read.by_ref().take(count).collect())
                 .collect();
-            Ok((texts, recognizer.language()))
-        })
-        .await?;
-    let name = model.to_string();
+            (texts, lang_owned)
+        } else {
+            let key = key(Stage::Recognize, config).expect("a recognizer is Koharu's");
+            let model = config.recognizer.model;
+            task.inference(&members.iter().collect::<Vec<_>>(), move |models| {
+                let recognizer = models.get(&key, |device| model::load(model, device))?;
+                    let texts = recognizer.inference(&images)?;
+                anyhow::ensure!(
+                    texts.len() == images.len(),
+                    "{} texts for {} blocks",
+                    texts.len(),
+                    images.len()
+                );
+                let mut read = blocks.into_iter().zip(texts);
+                let texts: Vec<Vec<(LayerId, String)>> = counts
+                    .into_iter()
+                    .map(|count| read.by_ref().take(count).collect())
+                    .collect();
+                Ok((texts, recognizer.language().to_owned()))
+            })
+            .await?
+        };
     for (member, texts) in members.iter().zip(texts) {
         let name = name.clone();
+        let language = language.clone();
         member
             .apply(Stage::Recognize, move |project| {
                 let mut ops = Vec::new();

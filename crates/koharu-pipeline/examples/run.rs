@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long, value_parser = parse::<Inpainter>)]
     inpainter: Option<Inpainter>,
 
+    /// Base URL of a remote OCR/inference server.
+    #[arg(long, value_name = "URL")]
+    ocr_remote: Option<String>,
+
     /// The translation model, as a `vendor/model` reference.
     #[arg(long, value_name = "MODEL")]
     translator: Option<String>,
@@ -108,6 +112,9 @@ async fn main() -> Result<()> {
     }
     if let Some(inpainter) = cli.inpainter {
         config.inpainter.model = inpainter;
+    }
+    if let Some(remote) = cli.ocr_remote {
+        config.recognizer.remote = Some(remote);
     }
     config.translator.vision = cli.vision;
     config.translator.reasoning = cli.reasoning.map(Into::into);
